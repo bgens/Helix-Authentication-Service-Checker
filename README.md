@@ -75,21 +75,17 @@ handles that encoding for you — pass the plaintext token via `--token` (or the
 ```bash
 python scim_create_user.py https://has.example.com:3000 \
     --token "keyboard cat" \
-    --username pparker@example.com \
-    --password 'iamSp!derm4n' \
-    --given-name Peter --family-name Parker \
-    --display-name "Peter Parker" \
-    --email pparker@example.com
+    --username legitimate_user \
+    --password 'password123!' \
+    --given-name Cat --family-name Dog \
+    --display-name "Cat Dog" \
+    --email legitimate_user@example.com
 
 python scim_create_user.py https://has.example.com:3000 \
     --token "keyboard cat" \
-    --username pparker@example.com \
-    --password 'iamSp!derm4n' \
+    --username legitimate_user \
+    --password 'password123!' \
     --user-agent "P4-HAS-SCANNER"
-
-# token from environment, self-signed cert
-BEARER_TOKEN='keyboard cat' python scim_create_user.py https://localhost:3000 \
-    --username jdoe@example.com --password 'S3cret!pass' --insecure
 ```
 
 ## Requirements
