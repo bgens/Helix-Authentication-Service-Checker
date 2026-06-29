@@ -49,7 +49,7 @@ python has_fingerprint.py --hosts-file hosts.txt --insecure
 When the positional target is omitted, `has_fingerprint.py` reads
 `has_targets.json` from the current directory. Each target record is converted
 from its `ip`, `port`, and optional `scheme` fields into the concrete URL to
-scan, such as `https://100.48.231.175:443`.
+scan, such as `https://127.0.0.1:443`.
 Target-list scans run concurrently by default; tune concurrency with
 `--workers`.
 
