@@ -44,6 +44,7 @@ Usage:
     python has_fingerprint.py https://perforce-has.example.com:3000/
     python has_fingerprint.py example.com:3000 --insecure --json
     python has_fingerprint.py https://host:3000 --timeout 8 --user-agent "asset-scan/1.0"
+    python has_fingerprint.py --hosts-file hosts.txt --insecure
 
 Requires only the Python 3.8+ standard library (no third-party packages).
 """
@@ -52,8 +53,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import hashlib
 import json
+import logging
 import re
 import socket
 import ssl
@@ -62,8 +65,9 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 
 # --------------------------------------------------------------------------- #
@@ -116,6 +120,9 @@ SAMPLE_CERT_SHA256 = "4e0cdc2c2237188d55edb99e09dca38763680cbd4ee46ce5ae34a0932c
 SAMPLE_CERT_SUBJECT_CN = "authen.doc"
 SAMPLE_CERT_ISSUER_CN = "FakeAuthority"
 SESSION_COOKIE_NAME = "JSESSIONID"
+DEFAULT_TARGETS_FILE = "has_targets.json"
+DEFAULT_WORKERS = 8
+LOGGER = logging.getLogger("has_fingerprint")
 
 # Pre-2020.2 builds used the Express-session default cookie name. Observing this
 # instead of JSESSIONID places the instance before the Sep-2020 cookie rename.
@@ -182,6 +189,7 @@ class Report:
     is_has: bool = False
     best_version: Optional[str] = None
     best_confidence: str = "none"
+    saml_hostnames: List[str] = field(default_factory=list)
     evidence: List[Evidence] = field(default_factory=list)
     findings: List[Finding] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
@@ -334,7 +342,7 @@ def probe_admin_assets(client: HttpClient, base: str, report: Report) -> None:
     matched_version: Optional[str] = None
     hashed_assets: List[str] = []
     for ref in refs:
-        asset_url = ref if ref.startswith("http") else base + ("" if ref.startswith("/") else "/admin/") + ref.lstrip("/")
+        asset_url = ref if ref.startswith("http") else urljoin(base + "/admin/", ref)
         a_status, _ah, a_body = client.get(asset_url)
         if a_status == 200 and a_body:
             digest = hashlib.sha256(a_body).hexdigest()
@@ -361,6 +369,36 @@ def probe_admin_assets(client: HttpClient, base: str, report: Report) -> None:
 # --------------------------------------------------------------------------- #
 # Strategy 3: SAML metadata structure (range)
 # --------------------------------------------------------------------------- #
+SAML_ENTITY_ID_RE = re.compile(r'entityID\s*=\s*["\']([^"\']+)["\']', re.I)
+SAML_LOCATION_RE = re.compile(r'Location\s*=\s*["\']([^"\']+)["\']', re.I)
+
+
+def _extract_saml_hosts(xml: str) -> Tuple[List[str], List[str]]:
+    """Return (entity_ids, hostnames) discovered in a SAML metadata document.
+
+    The entityID and the binding Location URLs frequently reveal the public
+    hostname the service was configured with (e.g. the SP issuer / ACS / SLO
+    endpoints), which can differ from the address we probed.
+    """
+    entity_ids: List[str] = []
+    hosts: List[str] = []
+    seen_hosts = set()
+
+    def _add_host(value: str) -> None:
+        host = urlparse(value).hostname if "://" in value else None
+        if host and host not in seen_hosts:
+            seen_hosts.add(host)
+            hosts.append(host)
+
+    for ent in SAML_ENTITY_ID_RE.findall(xml):
+        if ent not in entity_ids:
+            entity_ids.append(ent)
+        _add_host(ent)
+    for loc in SAML_LOCATION_RE.findall(xml):
+        _add_host(loc)
+    return entity_ids, hosts
+
+
 def probe_saml_metadata(client: HttpClient, base: str, report: Report) -> None:
     found_any = False
     for path in ("/saml/metadata", "/saml/idp/metadata"):
@@ -377,12 +415,27 @@ def probe_saml_metadata(client: HttpClient, base: str, report: Report) -> None:
             # node-saml v5 emits md: prefixed elements; older emits unprefixed
             ns_style = "md:-prefixed (node-saml v5.x style)" if "md:EntityDescriptor" in xml else "unprefixed elements"
             signals.append(ns_style)
+
+            # Pull the configured hostname(s) from the entityID / Location URLs.
+            entity_ids, hosts = _extract_saml_hosts(xml)
+            if entity_ids:
+                signals.append("entityID=" + ", ".join(entity_ids))
+            if hosts:
+                signals.append("hostname(s): " + ", ".join(hosts))
+                for h in hosts:
+                    if h not in report.saml_hostnames:
+                        report.saml_hostnames.append(h)
+                    note = f"SAML metadata at {path} reveals configured hostname: {h}"
+                    if note not in report.notes:
+                        report.notes.append(note)
+
             report.add(Evidence(
                 strategy="saml_metadata",
                 confidence="range",
                 detail=f"{path}: " + "; ".join(signals),
                 version_range="2024.x–2025.x (node-saml v5 family)" if "md:EntityDescriptor" in xml else "<=2023.x range",
-                raw={"content_type": headers.get("content-type")},
+                raw={"content_type": headers.get("content-type"),
+                     "entity_ids": entity_ids, "hostnames": hosts},
             ))
     if not found_any:
         report.add(Evidence(
@@ -828,14 +881,7 @@ def check_default_bearer_token(client: HttpClient, base: str, report: Report,
                          "repro": repro, "evidence": evidence},
                 ))
                 return
-    # All attempts rejected — record a reassuring informational finding.
-    report.add_finding(Finding(
-        id="HAS-DEFAULT-BEARER",
-        severity="info",
-        title="Default SCIM bearer token rejected",
-        detail="SCIM endpoints rejected the known default token(s): " + "; ".join(tested[:4]),
-        confirmed=False,
-    ))
+    # All attempts rejected: no finding.
 
 
 # --------------------------------------------------------------------------- #
@@ -1028,33 +1074,181 @@ def run(target: str, timeout: float, verify_tls: bool, user_agent: str,
     return report
 
 
+def target_from_record(record: Dict[str, Any], index: int) -> str:
+    """Convert one has_targets.json record into a concrete scheme://ip:port URL."""
+    host = str(record.get("ip") or record.get("host") or "").strip()
+    port = record.get("port")
+    if not host or port in (None, ""):
+        raise ValueError(f"target record {index} must include ip and port")
+
+    try:
+        port_number = int(port)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"target record {index} has invalid port: {port!r}") from exc
+
+    scheme = str(record.get("scheme") or "").strip().lower()
+    if not scheme:
+        scheme = "https" if port_number in (443, 8443) else "http"
+    if scheme not in ("http", "https"):
+        raise ValueError(f"target record {index} has unsupported scheme: {scheme!r}")
+
+    return f"{scheme}://{host}:{port_number}"
+
+
+def load_targets(path: str, selected_indices: Optional[List[int]] = None) -> List[str]:
+    """Load ip/port combinations from has_targets.json-style data."""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+    except OSError as exc:
+        raise ValueError(f"failed to read targets file {path!r}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"failed to parse targets file {path!r}: {exc}") from exc
+
+    if isinstance(data, dict) and isinstance(data.get("targets"), list):
+        records = data["targets"]
+    elif isinstance(data, list):
+        records = data
+    else:
+        raise ValueError("targets file must be a JSON array or an object with a targets array")
+
+    if selected_indices:
+        invalid = [idx for idx in selected_indices if idx < 0 or idx >= len(records)]
+        if invalid:
+            raise ValueError(
+                f"target index out of range: {', '.join(str(i) for i in invalid)} "
+                f"(file contains {len(records)} records)"
+            )
+        indices = selected_indices
+    else:
+        indices = list(range(len(records)))
+
+    targets: List[str] = []
+    for idx in indices:
+        record = records[idx]
+        if not isinstance(record, dict):
+            raise ValueError(f"target record {idx} must be a JSON object")
+        targets.append(target_from_record(record, idx))
+    return targets
+
+
+def load_hosts(path: str) -> List[str]:
+    """Load one hostname/base URL per line from a plain text file."""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            hosts = []
+            for line_number, line in enumerate(fh, start=1):
+                host = line.strip()
+                if not host or host.startswith("#"):
+                    continue
+                if any(ch.isspace() for ch in host):
+                    raise ValueError(f"hosts file {path!r} line {line_number} contains whitespace")
+                hosts.append(host)
+    except OSError as exc:
+        raise ValueError(f"failed to read hosts file {path!r}: {exc}") from exc
+
+    if not hosts:
+        raise ValueError(f"hosts file {path!r} did not contain any hosts")
+    return hosts
+
+
+def exit_code_for_reports(reports: List[Report]) -> int:
+    if not reports:
+        return 1
+    if any(SEVERITY_RANK.get(r.max_confirmed_severity(), 0) >= SEVERITY_RANK["high"] for r in reports):
+        return 3
+    if not any(r.reachable for r in reports):
+        return 1
+    if any(r.reachable and not r.is_has for r in reports):
+        return 2
+    return 0
+
+
+def run_one_target(target: str, timeout: float, verify_tls: bool, user_agent: str,
+                   try_http_fallback: bool, cred_tests: bool,
+                   reveal_identities: bool) -> Report:
+    try:
+        return run(
+            target=target,
+            timeout=timeout,
+            verify_tls=verify_tls,
+            user_agent=user_agent,
+            try_http_fallback=try_http_fallback,
+            cred_tests=cred_tests,
+            reveal_identities=reveal_identities,
+        )
+    except Exception as exc:
+        report = Report(target=target, base_url=normalize_base(target))
+        report.notes.append(f"Scanner error: {exc.__class__.__name__}: {exc}")
+        return report
+
+
+def scan_targets_concurrently(targets: List[str], workers: int, timeout: float,
+                              verify_tls: bool, user_agent: str,
+                              try_http_fallback: bool, cred_tests: bool,
+                              reveal_identities: bool) -> List[Report]:
+    reports: List[Optional[Report]] = [None] * len(targets)
+    max_workers = min(workers, len(targets))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_index = {
+            executor.submit(
+                run_one_target,
+                target,
+                timeout,
+                verify_tls,
+                user_agent,
+                try_http_fallback,
+                cred_tests,
+                reveal_identities,
+            ): index
+            for index, target in enumerate(targets)
+        }
+        for future in concurrent.futures.as_completed(future_to_index):
+            index = future_to_index[future]
+            reports[index] = future.result()
+    return [r for r in reports if r is not None]
+
+
 # --------------------------------------------------------------------------- #
 # Output
 # --------------------------------------------------------------------------- #
-def print_human(report: Report) -> None:
+def configure_logging(json_mode: bool) -> None:
+    LOGGER.handlers.clear()
+    LOGGER.setLevel(logging.INFO)
+    handler = logging.StreamHandler(sys.stderr if json_mode else sys.stdout)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    LOGGER.addHandler(handler)
+    LOGGER.propagate = False
+
+
+def format_human(report: Report) -> str:
     line = "=" * 70
-    print(line)
-    print(f"HAS fingerprint report  ({report.generated_at})")
-    print(f"Target      : {report.target}")
-    print(f"Base URL    : {report.base_url}")
-    print(f"Reachable   : {report.reachable}")
-    print(f"Is HAS      : {report.is_has}")
-    print(f"Best version: {report.best_version or 'unknown'}  "
-          f"(confidence: {report.best_confidence})")
-    print(line)
-    print("Evidence:")
+    lines = [
+        line,
+        f"HAS fingerprint report  ({report.generated_at})",
+        f"Target      : {report.target}",
+        f"Base URL    : {report.base_url}",
+        f"Reachable   : {report.reachable}",
+        f"Is HAS      : {report.is_has}",
+        f"Best version: {report.best_version or 'unknown'}  "
+        f"(confidence: {report.best_confidence})",
+    ]
+    if report.saml_hostnames:
+        lines.append(f"SAML host(s): {', '.join(report.saml_hostnames)}")
+    lines.append(line)
+    lines.append("Evidence:")
     if not report.evidence:
-        print("  (none)")
+        lines.append("  (none)")
     for ev in report.evidence:
         ver = ""
         if ev.version:
             ver = f"  => version={ev.version}"
         elif ev.version_range:
             ver = f"  => range={ev.version_range}"
-        print(f"  [{ev.confidence:5}] {ev.strategy}: {ev.detail}{ver}")
+        lines.append(f"  [{ev.confidence:5}] {ev.strategy}: {ev.detail}{ver}")
     if report.findings:
-        print(line)
-        print("Configuration findings:")
+        lines.append(line)
+        lines.append("Configuration findings:")
         order = sorted(
             report.findings,
             key=lambda f: (SEVERITY_RANK.get(f.severity, 0), f.confirmed),
@@ -1062,29 +1256,83 @@ def print_human(report: Report) -> None:
         )
         for f in order:
             mark = "CONFIRMED" if f.confirmed else "potential"
-            print(f"  [{f.severity.upper():8}] ({mark}) {f.title}")
-            print(f"            {f.detail}")
+            lines.append(f"  [{f.severity.upper():8}] ({mark}) {f.title}")
+            lines.append(f"            {f.detail}")
             if f.remediation:
-                print(f"            fix: {f.remediation}")
+                lines.append(f"            fix: {f.remediation}")
             # Print the reproducible PoC + captured evidence for confirmed findings.
             if f.confirmed and isinstance(f.raw, dict):
                 repro = f.raw.get("repro")
                 if isinstance(repro, dict):
-                    print(f"            repro (curl): {repro.get('curl')}")
-                    print(f"            expected before fix: {repro.get('expected_before_fix')}")
-                    print(f"            expected after fix : {repro.get('expected_after_fix')}")
+                    lines.append(f"            repro (curl): {repro.get('curl')}")
+                    lines.append(f"            expected before fix: {repro.get('expected_before_fix')}")
+                    lines.append(f"            expected after fix : {repro.get('expected_after_fix')}")
                 ev = f.raw.get("evidence")
                 if isinstance(ev, dict):
                     resp = ev.get("response", {})
-                    print(f"            evidence: HTTP {resp.get('status')} "
-                          f"{resp.get('headers', {}).get('content-type', '')} "
-                          f"body_sha256={resp.get('body_sha256', '')[:16]}…")
+                    lines.append(
+                        f"            evidence: HTTP {resp.get('status')} "
+                        f"{resp.get('headers', {}).get('content-type', '')} "
+                        f"body_sha256={resp.get('body_sha256', '')[:16]}…"
+                    )
     if report.notes:
-        print(line)
-        print("Notes:")
+        lines.append(line)
+        lines.append("Notes:")
         for n in report.notes:
-            print(f"  - {n}")
-    print(line)
+            lines.append(f"  - {n}")
+    lines.append(line)
+    return "\n".join(lines)
+
+
+def print_human(report: Report) -> None:
+    LOGGER.info(format_human(report))
+
+
+def format_summary(reports: List[Report]) -> str:
+    line = "=" * 70
+    total = len(reports)
+    reachable_count = sum(1 for r in reports if r.reachable)
+    has_count = sum(1 for r in reports if r.is_has)
+    unreachable_count = sum(1 for r in reports if not r.reachable)
+    not_has_count = sum(1 for r in reports if r.reachable and not r.is_has)
+    serious_count = sum(
+        1 for r in reports
+        if SEVERITY_RANK.get(r.max_confirmed_severity(), 0) >= SEVERITY_RANK["high"]
+    )
+
+    versions: Dict[str, int] = {}
+    for r in reports:
+        version = r.best_version or "unknown"
+        versions[version] = versions.get(version, 0) + 1
+
+    lines = [
+        line,
+        "Run summary",
+        f"Targets scanned       : {total}",
+        f"Reachable             : {reachable_count}",
+        f"Unreachable           : {unreachable_count}",
+        f"Identified as HAS     : {has_count}",
+        f"Reachable non-HAS     : {not_has_count}",
+        f"Confirmed high/critical: {serious_count}",
+        "Versions:",
+    ]
+    for version, count in sorted(versions.items(), key=lambda item: (-item[1], item[0])):
+        lines.append(f"  {version}: {count}")
+
+    notable = [
+        r for r in reports
+        if SEVERITY_RANK.get(r.max_confirmed_severity(), 0) >= SEVERITY_RANK["high"]
+    ]
+    if notable:
+        lines.append("Targets with confirmed high/critical findings:")
+        for r in notable:
+            lines.append(f"  {r.target}: {r.max_confirmed_severity().upper()}")
+    lines.append(line)
+    return "\n".join(lines)
+
+
+def print_summary(reports: List[Report]) -> None:
+    LOGGER.info(format_summary(reports))
 
 
 def main(argv: List[str]) -> int:
@@ -1092,7 +1340,20 @@ def main(argv: List[str]) -> int:
         description="Fingerprint a Helix Authentication Service (HAS) deployment "
                     "and identify its version. Authorized assessment use only."
     )
-    ap.add_argument("target", help="Base URL or host:port, e.g. https://host:3000/")
+    ap.add_argument("target", nargs="?",
+                    help="Base URL or host:port, e.g. https://host:3000/. "
+                        "Omit to read has_targets.json.")
+    ap.add_argument("--targets-file", metavar="PATH",
+                    help="JSON array of target records with ip and port fields. "
+                        "Defaults to has_targets.json when target is omitted.")
+    ap.add_argument("--hosts-file", metavar="PATH",
+                    help="Plain text file with one hostname, host:port, or URL per line. "
+                         "Blank lines and # comments are ignored.")
+    ap.add_argument("--target-index", type=int, action="append", default=[],
+                    help="Only scan the 0-based target record index from --targets-file. "
+                        "May be supplied multiple times.")
+    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                    help=f"Concurrent workers for target-list scans (default: {DEFAULT_WORKERS})")
     ap.add_argument("--timeout", type=float, default=10.0, help="Per-request timeout (s)")
     ap.add_argument("--insecure", action="store_true",
                     help="Do not verify TLS certificates (default verifies)")
@@ -1107,44 +1368,110 @@ def main(argv: List[str]) -> int:
     ap.add_argument("--save-evidence", metavar="PATH",
                     help="Write the full JSON report (findings + captured request/response "
                          "evidence + repro commands) to PATH for the engagement writeup.")
-    ap.add_argument("--user-agent", default="has-fingerprint/1.0 (asset-inventory)",
+    ap.add_argument("--user-agent", default="P4-HAS-SCANNER",
                     help="HTTP User-Agent string")
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     args = ap.parse_args(argv)
+    configure_logging(args.json)
 
-    report = run(
-        target=args.target,
-        timeout=args.timeout,
-        verify_tls=not args.insecure,
-        user_agent=args.user_agent,
-        try_http_fallback=not args.no_http_fallback,
-        cred_tests=not args.no_cred_tests,
-        reveal_identities=not args.mask_identities,
-    )
+    targets_file = args.targets_file
+    hosts_file = args.hosts_file
+    if sum(1 for source in (args.target, targets_file, hosts_file) if source) > 1:
+        ap.error("provide only one of positional target, --targets-file, or --hosts-file")
+    if args.target:
+        targets = [args.target]
+    elif hosts_file:
+        try:
+            targets = load_hosts(hosts_file)
+        except ValueError as exc:
+            ap.error(str(exc))
+    else:
+        targets_file = targets_file or DEFAULT_TARGETS_FILE
+        if not Path(targets_file).exists():
+            ap.error("target is required unless --targets-file, --hosts-file, or has_targets.json exists")
+        try:
+            targets = load_targets(targets_file, args.target_index)
+        except ValueError as exc:
+            ap.error(str(exc))
+
+    if args.target_index and (args.target or hosts_file):
+        ap.error("--target-index can only be used with --targets-file or omitted target")
+    if args.workers < 1:
+        ap.error("--workers must be at least 1")
+
+    reports: List[Report] = []
 
     if args.json:
-        print(json.dumps(report.to_dict(), indent=2, default=str))
+        reports = scan_targets_concurrently(
+            targets=targets,
+            workers=args.workers,
+            timeout=args.timeout,
+            verify_tls=not args.insecure,
+            user_agent=args.user_agent,
+            try_http_fallback=not args.no_http_fallback,
+            cred_tests=not args.no_cred_tests,
+            reveal_identities=not args.mask_identities,
+        )
+        payload: Any = reports[0].to_dict() if len(reports) == 1 else [r.to_dict() for r in reports]
+        print(json.dumps(payload, indent=2, default=str))
     else:
-        print_human(report)
+        if len(targets) > 1:
+            LOGGER.info(
+                "Loaded %s targets from %s; scanning with %s workers",
+                len(targets),
+                hosts_file or targets_file,
+                min(args.workers, len(targets)),
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.workers, len(targets))) as executor:
+                future_to_target = {
+                    executor.submit(
+                        run_one_target,
+                        target,
+                        args.timeout,
+                        not args.insecure,
+                        args.user_agent,
+                        not args.no_http_fallback,
+                        not args.no_cred_tests,
+                        not args.mask_identities,
+                    ): target
+                    for target in targets
+                }
+                for completed, future in enumerate(concurrent.futures.as_completed(future_to_target), start=1):
+                    target = future_to_target[future]
+                    LOGGER.info("\nCompleted target %s/%s: %s", completed, len(targets), target)
+                    report = future.result()
+                    reports.append(report)
+                    print_human(report)
+        else:
+            report = run_one_target(
+                targets[0],
+                args.timeout,
+                not args.insecure,
+                args.user_agent,
+                not args.no_http_fallback,
+                not args.no_cred_tests,
+                not args.mask_identities,
+            )
+            reports.append(report)
+            print_human(report)
+        if len(reports) > 1:
+            print_summary(reports)
 
     if args.save_evidence:
         try:
             with open(args.save_evidence, "w", encoding="utf-8") as fh:
-                json.dump(report.to_dict(), fh, indent=2, default=str)
-            print(f"\n[+] Evidence bundle written to {args.save_evidence}")
+                payload = reports[0].to_dict() if len(reports) == 1 else [r.to_dict() for r in reports]
+                json.dump(payload, fh, indent=2, default=str)
+            LOGGER.info("\n[+] Evidence bundle written to %s", args.save_evidence)
         except OSError as e:
-            print(f"\n[!] Failed to write evidence bundle: {e}", file=sys.stderr)
+            LOGGER.error("\n[!] Failed to write evidence bundle: %s", e)
 
     # Exit codes for scripting/asset pipelines:
     #   1 = unreachable
     #   3 = reachable and at least one CONFIRMED high/critical config finding
     #   0 = identified as HAS (no confirmed high/critical finding)
     #   2 = reachable but not identified as HAS
-    if not report.reachable:
-        return 1
-    if SEVERITY_RANK.get(report.max_confirmed_severity(), 0) >= SEVERITY_RANK["high"]:
-        return 3
-    return 0 if report.is_has else 2
+    return exit_code_for_reports(reports)
 
 
 if __name__ == "__main__":

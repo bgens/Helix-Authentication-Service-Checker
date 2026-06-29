@@ -5,10 +5,7 @@ asset inventory of [Helix Authentication Service (HAS)](https://www.perforce.com
 deployments. Both scripts use only the Python 3.8+ standard library — no
 third-party packages required.
 
-> ⚠️ **Use only against hosts you own or are explicitly authorized to assess.**
-> These tools are intended for defensive security review, configuration
-> hardening, and asset inventory. Unauthorized use against systems you do not
-> control may be illegal.
+> **Use only against hosts you own or are explicitly authorized to assess.**
 
 ## Scripts
 
@@ -42,7 +39,27 @@ actively verified.
 ```bash
 python has_fingerprint.py https://perforce-has.example.com:3000/
 python has_fingerprint.py example.com:3000 --insecure --json
-python has_fingerprint.py https://host:3000 --timeout 8 --user-agent "asset-scan/1.0"
+python has_fingerprint.py https://host:3000 --timeout 8 --user-agent "P4-HAS-SCANNER"
+python has_fingerprint.py --targets-file has_targets.json --insecure
+python has_fingerprint.py --targets-file has_targets.json --target-index 0 --insecure
+python has_fingerprint.py --targets-file has_targets.json --workers 16 --insecure
+python has_fingerprint.py --hosts-file hosts.txt --insecure
+```
+
+When the positional target is omitted, `has_fingerprint.py` reads
+`has_targets.json` from the current directory. Each target record is converted
+from its `ip`, `port`, and optional `scheme` fields into the concrete URL to
+scan, such as `https://100.48.231.175:443`.
+Target-list scans run concurrently by default; tune concurrency with
+`--workers`.
+
+For hostname-based input, use `--hosts-file` with one hostname, `host:port`, or
+URL per line. Blank lines and lines beginning with `#` are ignored:
+
+```text
+host1.example.com
+host2.example.com:3000
+https://host3.example.com
 ```
 
 ### `scim_create_user.py`
@@ -63,6 +80,12 @@ python scim_create_user.py https://has.example.com:3000 \
     --given-name Peter --family-name Parker \
     --display-name "Peter Parker" \
     --email pparker@example.com
+
+python scim_create_user.py https://has.example.com:3000 \
+    --token "keyboard cat" \
+    --username pparker@example.com \
+    --password 'iamSp!derm4n' \
+    --user-agent "P4-HAS-SCANNER"
 
 # token from environment, self-signed cert
 BEARER_TOKEN='keyboard cat' python scim_create_user.py https://localhost:3000 \

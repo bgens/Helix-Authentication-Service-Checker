@@ -136,7 +136,7 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     p.add_argument("--external-id", help="Optional SCIM externalId.")
     p.add_argument("--timeout", type=float, default=10.0, help="Per-request timeout in seconds.")
     p.add_argument("--insecure", action="store_true", help="Do not verify the TLS certificate.")
-    p.add_argument("--user-agent", default="scim-create-user/1.0", help="HTTP User-Agent header.")
+    p.add_argument("--user-agent", default="P4-HAS-SCANNER", help="HTTP User-Agent header.")
     p.add_argument("--json", action="store_true", help="Print the raw JSON response only.")
     return p.parse_args(argv)
 

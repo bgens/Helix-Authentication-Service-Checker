@@ -33,6 +33,7 @@ htmlcov/
 *.out
 output/
 reports/
+*.json
 *.json.bak
 
 # Secrets / local config (do not commit tokens or env files)
