@@ -9,6 +9,26 @@ third-party packages required.
 
 ## Scripts
 
+### `extract_has_targets.py`
+
+Takes JSON exported from Shodan for Helix Authentication Service systems and
+keeps only the target details this toolkit needs. Shodan banner output can be
+large and awkward to pass between tools; this script filters for HAS-looking
+records by default, extracts the endpoint fields we care about, and emits a
+smaller plain-text, CSV, or JSON target list that is easier to review, pipe, or
+feed into `has_fingerprint.py`.
+
+Accepted inputs include NDJSON / JSON Lines banner data, a single JSON array,
+or a Shodan search API result shaped like `{ "matches": [...] }`.
+
+**Usage:**
+
+```bash
+python extract_has_targets.py shodan_has_download.json --format json -o has_targets.json --dedupe
+python extract_has_targets.py shodan_has_download.json --url --dedupe
+python extract_has_targets.py shodan_has_download.json --format csv -o has_targets.csv
+```
+
 ### `has_fingerprint.py`
 
 Fingerprints a HAS deployment and identifies its service version using a range
